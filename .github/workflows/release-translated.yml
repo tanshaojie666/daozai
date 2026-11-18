@@ -72,7 +72,7 @@ jobs:
           # 版本号 = 上游补丁号 + 100，已被占用就继续往上加，保证永远比已发的旧版大
           $parts = $ver.Split('.')
           $patch = [int]$parts[2] + 100 + $extra
-          $taken = @(gh release list --limit 200 --json tagName --jq '.[].tagName')
+          $taken = @(gh release list --limit 200 --json tagName --jq '.[].tagName' --repo $env:OUR_REPO)
           while ($taken -contains "v$($parts[0]).$($parts[1]).$patch") { $patch++ }
           $ours = "$($parts[0]).$($parts[1]).$patch"
 
@@ -196,7 +196,8 @@ jobs:
             "- 安装包：Daozai-Setup-v$ours-x64.exe",
             "- 免安装 / 应用内更新：Daozai-v$ours-windows-x64.zip"
           ) -join "`n" | Set-Content -LiteralPath notes.md -Encoding utf8
-          gh release create "v$ours" $zip $setup "dist/SHA256SUMS.txt" --title "v$ours（含快捷翻译）" --notes-file notes.md
+          # 必须显式 --repo：仓库里同时有 origin 和 upstream 时 gh 会挑错远端
+          gh release create "v$ours" $zip $setup "dist/SHA256SUMS.txt" --repo $env:OUR_REPO --title "v$ours（含快捷翻译）" --notes-file notes.md
           if ($LASTEXITCODE -ne 0) { throw '创建 Release 失败' }
 
           # 应用内更新要求资源带 sha256 摘要，地址与仓库一致；GitHub 没算摘要就等于更新按钮不可用
