@@ -2,9 +2,10 @@
 use eframe::egui;
 use std::{io::{Read, Write}, path::PathBuf, sync::{mpsc::{self, Receiver}, Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
-const REPOSITORY: &str = "https://github.com/Renly1994/xiaotang-daozai";
-const API: &str = "https://api.github.com/repos/Renly1994/xiaotang-daozai/releases/latest";
-const RELEASES: &str = "https://github.com/Renly1994/xiaotang-daozai/releases/latest";
+// 本仓是翻译版：更新源指向自己的发布页，装到的永远带「快捷翻译」页。上游仓库只用于合并代码。
+const REPOSITORY: &str = "https://github.com/tanshaojie666/daozai";
+const API: &str = "https://api.github.com/repos/tanshaojie666/daozai/releases/latest";
+const RELEASES: &str = "https://github.com/tanshaojie666/daozai/releases/latest";
 const BACKUP_DOWNLOAD: &str = "https://pan.quark.cn/s/0a39b4e1f332";
 const STARTUP_DELAY: Duration = Duration::from_secs(10);
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
