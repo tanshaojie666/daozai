@@ -1,0 +1,206 @@
+name: 发布翻译版
+
+# 上游发版 → 合并上游标签 → 用官方打包脚本编译 → 发布 Daozai-v{补丁号+100}。
+# 岛仔的应用内更新指向本仓，所以每次更新装到的都是带「快捷翻译」页的版本。
+#
+# 关键约定：版本号只在构建工作区里注入，不提交回仓库。
+# 否则每次上游改版本行都会和本仓的版本行冲突，自动合并就会失败。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 上游标签没变也强制发一版
+        type: boolean
+        default: false
+      extra:
+        description: 版本号额外加几（要立刻造一个更高的版本号时填 1）
+        type: number
+        default: 0
+  schedule:
+    # 每天 12:23（北京时间）对一次上游
+    - cron: '23 4 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-translated
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/Renly1994/xiaotang-daozai.git
+  OUR_REPO: tanshaojie666/daozai
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: 决定版本号
+        id: decide
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'daozai-release'; Accept = 'application/vnd.github+json' }
+
+          # 上游最新的正式标签
+          $tags = git ls-remote --tags --refs $env:UPSTREAM_URL |
+            ForEach-Object { ($_ -split '\s+')[-1] } |
+            Where-Object { $_ -match '^refs/tags/v\d+\.\d+\.\d+$' } |
+            ForEach-Object { $_.Substring('refs/tags/'.Length) }
+          $tag = $tags | Sort-Object { [version]($_.TrimStart('v')) } | Select-Object -Last 1
+          if (-not $tag) { throw '上游没有可用的版本标签' }
+          $ver = $tag.TrimStart('v')
+
+          # 上一次发布对应哪个上游版本（发布说明里的 Upstream: 行）
+          $last = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$($env:OUR_REPO)/releases?per_page=1" -Headers $headers)
+          $builtFor = $null
+          if ($last.Count -ge 1 -and $last[0].body -match '(?m)^Upstream: v(\S+)\s*$') { $builtFor = $Matches[1] }
+
+          $force = '${{ inputs.force }}' -eq 'true'
+          $needed = $force -or ($builtFor -ne $ver)
+
+          # 版本号 = 上游补丁号 + 100，已被占用就继续往上加，保证永远比已发的旧版大
+          $parts = $ver.Split('.')
+          $patch = [int]$parts[2] + 100 + [int]'${{ inputs.extra }}'
+          $taken = @(gh release list --limit 200 --json tagName --jq '.[].tagName')
+          while ($taken -contains "v$($parts[0]).$($parts[1]).$patch") { $patch++ }
+          $ours = "$($parts[0]).$($parts[1]).$patch"
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+          "ours=$ours" >> $env:GITHUB_OUTPUT
+          "needed=$($needed.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "上游 $tag；上次为 $builtFor 发版；本次版本 $ours；需要发布=$needed"
+
+      - name: 合并上游标签
+        if: steps.decide.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name  'daozai-release-bot'
+          git config user.email 'daozai-release-bot@users.noreply.github.com'
+          git remote add upstream $env:UPSTREAM_URL 2>$null
+          git fetch --force --tags upstream
+          if ($LASTEXITCODE -ne 0) { throw '拉取上游失败' }
+
+          $tag = '${{ steps.decide.outputs.tag }}'
+          git merge-base --is-ancestor "refs/tags/$tag" HEAD
+          if ($LASTEXITCODE -eq 0) { Write-Host "上游 $tag 已在历史里，跳过合并"; exit 0 }
+
+          git merge --no-edit "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) {
+            git merge --abort
+            throw "合并上游 $tag 冲突。自动流程不做猜测，请在本地解决冲突后推送，再重跑本工作流。"
+          }
+          git push origin HEAD:main
+          Write-Host "已合并上游 $tag 并推送"
+
+      - name: 注入版本号
+        if: steps.decide.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ours = '${{ steps.decide.outputs.ours }}'
+          $p = $ours.Split('.')
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          $toml = (Get-Content Cargo.toml -Raw) -replace '(?m)^version = "[^"]+"', "version = `"$ours`""
+          [IO.File]::WriteAllText("$PWD/Cargo.toml", $toml, $utf8)
+
+          $lines = Get-Content Cargo.lock
+          $hit = $false
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -ceq 'name = "daozai"') { $lines[$i+1] = "version = `"$ours`"" ; $hit = $true ; break }
+          }
+          if (-not $hit) { throw 'Cargo.lock 里找不到 daozai 包' }
+          [IO.File]::WriteAllLines("$PWD/Cargo.lock", $lines, $utf8)
+
+          $rc = Get-Content app.rc -Raw
+          $rc = $rc -replace 'FILEVERSION \d+,\d+,\d+,0', "FILEVERSION $($p[0]),$($p[1]),$($p[2]),0"
+          $rc = $rc -replace 'PRODUCTVERSION \d+,\d+,\d+,0', "PRODUCTVERSION $($p[0]),$($p[1]),$($p[2]),0"
+          $rc = $rc -replace 'VALUE "ProductVersion", "[^"]+"', "VALUE `"ProductVersion`", `"$ours`""
+          $rc = $rc -replace 'VALUE "FileVersion", "[^"]+"', "VALUE `"FileVersion`", `"$ours`""
+          [IO.File]::WriteAllText("$PWD/app.rc", $rc, $utf8)
+
+          Select-String -Path Cargo.toml, Cargo.lock, app.rc -Pattern ([regex]::Escape($ours)) |
+            ForEach-Object { "  $($_.Filename): $($_.Line.Trim())" }
+
+      - name: 安装 Rust
+        if: steps.decide.outputs.needed == 'true'
+        run: rustup toolchain install stable --profile minimal
+
+      - name: 编译并打包
+        if: steps.decide.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $nsis = ./scripts/get-nsis.ps1 -Directory $env:RUNNER_TEMP
+          ./scripts/package.ps1 -NsisCompiler $nsis
+
+      - name: 校验产物
+        if: steps.decide.outputs.needed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ours = '${{ steps.decide.outputs.ours }}'
+          $zip = "dist/Daozai-v$ours-windows-x64.zip"
+          $exe = "dist/Daozai-v$ours-windows-x64/daozai.exe"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "缺少 $zip" }
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $zip))
+          $names = @($archive.Entries.FullName)
+          $archive.Dispose()
+          # 应用内更新的安装脚本按这个路径取程序
+          $want = "Daozai-v$ours-windows-x64/daozai.exe"
+          if (-not ($names -contains $want -or $names -contains $want.Replace('/', '\'))) {
+            throw "压缩包里没有 $want，实际内容：$($names -join ' | ')"
+          }
+          $vi = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path -LiteralPath $exe))
+          if ($vi.FileVersion -ne $ours -and $vi.FileVersion -ne "$ours.0") {
+            throw "exe 版本是 $($vi.FileVersion)，应为 $ours"
+          }
+          Write-Host "产物校验通过：$want，FileVersion=$($vi.FileVersion)"
+
+      - name: 创建 Release
+        if: steps.decide.outputs.needed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ours = '${{ steps.decide.outputs.ours }}'
+          $ver  = '${{ steps.decide.outputs.ver }}'
+          $tag  = '${{ steps.decide.outputs.tag }}'
+          $zip = "dist/Daozai-v$ours-windows-x64.zip"
+          $setup = "dist/Daozai-Setup-v$ours-x64.exe"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "缺少 $zip" }
+          @(
+            "基于上游 $tag，保留「快捷翻译」页。",
+            "",
+            "Upstream: v$ver",
+            "",
+            "- 安装包：Daozai-Setup-v$ours-x64.exe",
+            "- 免安装 / 应用内更新：Daozai-v$ours-windows-x64.zip"
+          ) -join "`n" | Set-Content -LiteralPath notes.md -Encoding utf8
+          gh release create "v$ours" $zip $setup "dist/SHA256SUMS.txt" --title "v$ours（含快捷翻译）" --notes-file notes.md
+          if ($LASTEXITCODE -ne 0) { throw '创建 Release 失败' }
+
+          # 应用内更新要求资源带 sha256 摘要，地址与仓库一致；GitHub 没算摘要就等于更新按钮不可用
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; 'User-Agent' = 'daozai-release'; Accept = 'application/vnd.github+json' }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$($env:OUR_REPO)/releases/tags/v$ours" -Headers $headers
+          $asset = $release.assets | Where-Object { $_.name -eq "Daozai-v$ours-windows-x64.zip" }
+          if (-not $asset) { throw '发布里没有 zip 资源' }
+          if (-not $asset.digest) { throw 'GitHub 没有为资源生成 sha256 摘要，应用内更新会拒绝安装' }
+          $expected = "https://github.com/$($env:OUR_REPO)/releases/download/v$ours/Daozai-v$ours-windows-x64.zip"
+          if ($asset.browser_download_url -ne $expected) { throw "下载地址不符：$($asset.browser_download_url)" }
+          Write-Host "发布完成：v$ours  digest=$($asset.digest)  size=$($asset.size)"
+
+      - name: 无新版本
+        if: steps.decide.outputs.needed != 'true'
+        run: Write-Host "上游 ${{ steps.decide.outputs.tag }} 已发布过 v${{ steps.decide.outputs.ours }}，本次不做事。"
