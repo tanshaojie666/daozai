@@ -139,6 +139,12 @@ jobs:
         if: steps.decide.outputs.needed == 'true'
         run: rustup toolchain install stable --profile minimal
 
+      - name: 缓存依赖
+        if: steps.decide.outputs.needed == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: translated
+
       - name: 编译并打包
         if: steps.decide.outputs.needed == 'true'
         shell: pwsh
