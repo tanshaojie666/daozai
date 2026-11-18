@@ -1,5 +1,6 @@
 //! 把岛仔图标作为 RT_GROUP_ICON #1 编进 exe，供 LoadImageW(hInst, 1, ...) 取用。
-//! 不引入额外依赖：直接调用 Windows SDK 的 rc.exe，把 .res 交给链接器。
+//! MSVC 目标用 Windows SDK 的 rc.exe；没有 SDK 时退回 MinGW 的 windres（GNU 目标带得动）。
+//! 两者都找不到就跳过，只少一个图标，不影响编译。
 
 use std::env;
 use std::fs;
@@ -29,6 +30,17 @@ fn find_rc() -> Option<PathBuf> {
     found.pop()
 }
 
+fn find_windres() -> Option<PathBuf> {
+    if let Some(explicit) = env::var_os("WINDRES") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path).map(|dir| dir.join("windres.exe")).find(|candidate| candidate.exists())
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=assets/daozai.ico");
@@ -36,20 +48,32 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("daozai.res");
-    let Some(rc) = find_rc() else {
-        println!("cargo:warning=rc.exe 未找到，跳过图标资源");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    // rc.exe 产出 .res，windres 产出 COFF 对象；两者都能直接交给链接器。
+    let compiled = if let Some(rc) = find_rc() {
+        let res = out.join("daozai.res");
+        let ok = Command::new(&rc).arg("/nologo").arg("/fo").arg(&res).arg("app.rc").status().map(|s| s.success()).unwrap_or(false);
+        (ok, res)
+    } else if let Some(windres) = find_windres() {
+        let object = out.join("daozai-res.o");
+        let ok = Command::new(&windres)
+            .arg("-i")
+            .arg("app.rc")
+            .arg("-o")
+            .arg(&object)
+            .arg("--target=pe-x86-64")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        (ok, object)
+    } else {
+        println!("cargo:warning=找不到 rc.exe 或 windres，跳过图标资源");
         return;
     };
-    let status = Command::new(&rc)
-        .arg("/nologo")
-        .arg("/fo")
-        .arg(&out)
-        .arg("app.rc")
-        .status();
-    if !status.map(|s| s.success()).unwrap_or(false) {
-        println!("cargo:warning=rc.exe 编译 app.rc 失败");
+    if !compiled.0 {
+        println!("cargo:warning=编译 app.rc 失败，跳过图标资源");
         return;
     }
-    println!("cargo:rustc-link-arg={}", out.display());
+    println!("cargo:rustc-link-arg={}", compiled.1.display());
 }

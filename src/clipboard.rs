@@ -168,6 +168,16 @@ pub fn watch(shared: Shared, repaint: impl Fn() + Send + 'static) -> Option<Watc
 #[cfg(not(windows))]
 pub fn watch(_shared: Shared, _repaint: impl Fn() + Send + 'static) -> Option<Watcher> { Some(Watcher {}) }
 
+/// 读取当前剪贴板里的文字（不写入历史），供翻译页填入原文。
+#[cfg(windows)]
+pub fn current_text() -> Option<String> {
+    win::read_current()
+}
+#[cfg(not(windows))]
+pub fn current_text() -> Option<String> {
+    None
+}
+
 #[cfg(windows)]
 const HISTORY_COPY_FORMAT: &str = "Daozai.ClipboardHistoryCopy";
 
@@ -274,6 +284,11 @@ mod win {
         })();
         let _ = CloseClipboard();
         text
+    }
+
+    /// 主动读一次剪贴板；监听线程之外的调用方（翻译页）用它。
+    pub fn read_current() -> Option<String> {
+        unsafe { read_text(HWND(std::ptr::null_mut())).map(|(text, _)| text) }
     }
 
     pub fn run(shared: Shared, repaint: Box<dyn Fn() + Send>, stop: &Stop) -> windows::core::Result<()> {

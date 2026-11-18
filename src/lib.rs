@@ -44,6 +44,7 @@ mod weather_ui;
 mod weather_source_ui;
 mod qweather;
 mod pages;
+mod translate;
 mod extras;
 mod pet;
 mod pet_expressions;

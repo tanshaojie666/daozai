@@ -46,6 +46,9 @@ fn save(slot:&str,key:&str)->Result<(),String>{credential(slot)?.set_password(ke
 fn save(_slot:&str,_key:&str)->Result<(),String>{Err("当前系统不支持安全保存 API Key".into())}
 #[cfg(windows)]
 fn load(slot:&str)->Result<String,String>{credential(slot)?.get_password().map_err(|error|match error {keyring::Error::NoEntry=>"未找到已保存的 DeepSeek API Key，请重新连接".into(),_=>"暂时无法读取 Windows 凭据，请稍后重试".into()})}
+/// 供翻译页复用「AI 额度」里已连接的 DeepSeek 密钥。
+#[cfg(windows)]
+pub fn load_key(slot:&str)->Result<String,String>{load(slot)}
 #[cfg(not(windows))]
 fn load(_slot:&str)->Result<String,String>{Err("当前系统不支持读取 API Key".into())}
 pub fn forget(account:&Account){
