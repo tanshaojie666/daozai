@@ -65,11 +65,13 @@ jobs:
           if ($last.Count -ge 1 -and $last[0].body -match '(?m)^Upstream: v(\S+)\s*$') { $builtFor = $Matches[1] }
 
           $force = '${{ inputs.force }}' -eq 'true'
-          $needed = $force -or ($builtFor -ne $ver)
+          $extra = [int]'${{ inputs.extra }}'
+          # extra > 0 表示「就要再发一版」，即使上游没变也要发
+          $needed = $force -or ($extra -gt 0) -or ($builtFor -ne $ver)
 
           # 版本号 = 上游补丁号 + 100，已被占用就继续往上加，保证永远比已发的旧版大
           $parts = $ver.Split('.')
-          $patch = [int]$parts[2] + 100 + [int]'${{ inputs.extra }}'
+          $patch = [int]$parts[2] + 100 + $extra
           $taken = @(gh release list --limit 200 --json tagName --jq '.[].tagName')
           while ($taken -contains "v$($parts[0]).$($parts[1]).$patch") { $patch++ }
           $ours = "$($parts[0]).$($parts[1]).$patch"
