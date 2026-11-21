@@ -1,7 +1,7 @@
-name: 发布翻译版
+name: 发布对话版
 
 # 上游发版 → 合并上游标签 → 用官方打包脚本编译 → 发布 Daozai-v{补丁号+100}。
-# 岛仔的应用内更新指向本仓，所以每次更新装到的都是带「快捷翻译」页的版本。
+# 岛仔的应用内更新指向本仓，所以每次更新装到的都是带「AI 对话」页的版本。
 #
 # 关键约定：版本号只在构建工作区里注入，不提交回仓库。
 # 否则每次上游改版本行都会和本仓的版本行冲突，自动合并就会失败。
@@ -189,15 +189,21 @@ jobs:
           $setup = "dist/Daozai-Setup-v$ours-x64.exe"
           if (-not (Test-Path -LiteralPath $zip)) { throw "缺少 $zip" }
           @(
-            "基于上游 $tag，保留「快捷翻译」页。",
+            "基于上游 $tag，保留「AI 对话」页（替换原「快捷翻译」页）。",
             "",
             "Upstream: v$ver",
+            "",
+            "本版内容：",
+            "- AI 对话：多轮聊天、流式输出，历史存在本机",
+            "- 服务商可切换：DeepSeek / 阿里云百炼，同协议的转发站也能接（设置项 aliyun_base）",
+            "- 模型面板：拉取接口返回的全部模型，点一下切换，挑过的模型记在列表里",
+            "- 输入框拿到系统键盘焦点，可以直接打字（原来点了打不出字）",
             "",
             "- 安装包：Daozai-Setup-v$ours-x64.exe",
             "- 免安装 / 应用内更新：Daozai-v$ours-windows-x64.zip"
           ) -join "`n" | Set-Content -LiteralPath notes.md -Encoding utf8
           # 必须显式 --repo：仓库里同时有 origin 和 upstream 时 gh 会挑错远端
-          gh release create "v$ours" $zip $setup "dist/SHA256SUMS.txt" --repo $env:OUR_REPO --title "v$ours（含快捷翻译）" --notes-file notes.md
+          gh release create "v$ours" $zip $setup "dist/SHA256SUMS.txt" --repo $env:OUR_REPO --title "v$ours（含 AI 对话）" --notes-file notes.md
           if ($LASTEXITCODE -ne 0) { throw '创建 Release 失败' }
 
           # 应用内更新要求资源带 sha256 摘要，地址与仓库一致；GitHub 没算摘要就等于更新按钮不可用
