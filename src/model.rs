@@ -36,7 +36,7 @@ fn read_kv(path: &Path) -> Vec<(String, String)> {
     out
 }
 
-fn write_kv(path: &Path, pairs: &[(String, String)]) -> std::io::Result<()> {
+pub(crate) fn write_kv(path: &Path, pairs: &[(String, String)]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -45,6 +45,23 @@ fn write_kv(path: &Path, pairs: &[(String, String)]) -> std::io::Result<()> {
         .map(|(k, v)| format!("{k}={v}\n"))
         .collect();
     atomic_write(path, body.as_bytes())
+}
+
+/// 对话页的模型列表按逗号拆分：去空白、去重、丢掉不像模型名的片段；空了回落到默认值。
+fn clean_models(value: &str, fallback: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for part in value.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        if part.len() > 96 || part.chars().any(char::is_whitespace) {
+            continue;
+        }
+        if !out.iter().any(|kept| kept.eq_ignore_ascii_case(part)) {
+            out.push(part.to_string());
+        }
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    if out.is_empty() { fallback.to_string() } else { out.join(",") }
 }
 
 pub(crate) fn load_health_pending()->[bool;2] {
@@ -281,8 +298,17 @@ pub struct Settings {
     pub weather_position: Option<crate::weather::Position>,
     /// 已保存、可在岛上下拉切换的城市（不含自动定位），最多 `weather::MAX_CITIES` 个。
     pub weather_saved: Vec<crate::weather::Position>,
-    /// 翻译页使用的 DeepSeek 模型名；留空用 `deepseek-chat`。
-    pub translate_model: String,
+    /// 对话页使用的 DeepSeek 模型名；留空用 `deepseek-chat`。
+    pub chat_model: String,
+    /// 对话页的服务商：`deepseek`（默认）或 `aliyun`（阿里云百炼 DashScope）。
+    pub chat_provider: String,
+    /// 阿里云百炼的模型名；留空用 `qwen-plus`。
+    pub aliyun_model: String,
+    /// 通义千问的接口基地址；留空用阿里云百炼官方地址，可填同协议的转发站。
+    pub aliyun_base: String,
+    /// 对话页「模型」面板里自己挑中的模型（逗号分隔），点一次模型就记一个。
+    pub chat_models_deepseek: String,
+    pub chat_models_aliyun: String,
     /// 兼容渲染：用 Direct3D 12 代替 OpenGL（部分显卡的 OpenGL 驱动会崩溃或画面错乱）。重启后生效。
     pub render_compat: bool,
     /// 自动切换到兼容渲染的原因；手动开启时为空。
@@ -291,7 +317,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), translate_model: "deepseek-chat".into(), render_compat: false, render_compat_reason: String::new() }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), chat_model: "deepseek-chat".into(), chat_provider: "deepseek".into(), aliyun_model: "qwen-plus".into(), aliyun_base: String::new(), chat_models_deepseek: crate::chat::DEEPSEEK_MODELS.into(), chat_models_aliyun: crate::chat::ALIYUN_MODELS.into(), render_compat: false, render_compat_reason: String::new() }
     }
 }
 
@@ -421,7 +447,13 @@ impl Settings {
                 "weather_position" => s.weather_position=serde_json::from_str::<Option<crate::weather::Position>>(&v).ok().flatten().filter(|p|p.valid()),
                 "weather_saved" => s.weather_saved=serde_json::from_str::<Vec<crate::weather::Position>>(&v).unwrap_or_default().into_iter().filter(|p|p.valid()).collect(),
                 "render_compat" => s.render_compat = v == "1",
-                "translate_model" => s.translate_model = if v.trim().is_empty() { crate::translate::DEFAULT_MODEL.into() } else { v.trim().to_string() },
+                // 旧版把这一项叫 translate_model，读到就沿用，保证升级后设置不丢。
+                "chat_model" | "translate_model" => s.chat_model = if v.trim().is_empty() { crate::chat::DEFAULT_MODEL.into() } else { v.trim().to_string() },
+                "chat_provider" => s.chat_provider = match v.trim().to_ascii_lowercase().as_str() { "aliyun" | "dashscope" | "qwen" => "aliyun", _ => "deepseek" }.to_string(),
+                "aliyun_model" => s.aliyun_model = if v.trim().is_empty() { crate::chat::ALIYUN_MODEL.into() } else { v.trim().to_string() },
+                "aliyun_base" => s.aliyun_base = v.trim().trim_end_matches('/').to_string(),
+                "chat_models_deepseek" => s.chat_models_deepseek = clean_models(&v, crate::chat::DEEPSEEK_MODELS),
+                "chat_models_aliyun" => s.chat_models_aliyun = clean_models(&v, crate::chat::ALIYUN_MODELS),
                 "render_compat_reason" => s.render_compat_reason = v.chars().filter(|c| !c.is_control()).take(200).collect(),
                 _ => {}
             }
@@ -505,7 +537,12 @@ impl Settings {
                 ("weather_city".into(), self.weather_city.clone()),
                 ("weather_position".into(), serde_json::to_string(&self.weather_position).unwrap()),
                 ("weather_saved".into(), serde_json::to_string(&self.weather_saved).unwrap()),
-                ("translate_model".into(), self.translate_model.clone()),
+                ("chat_model".into(), self.chat_model.clone()),
+                ("chat_provider".into(), self.chat_provider.clone()),
+                ("aliyun_model".into(), self.aliyun_model.clone()),
+                ("aliyun_base".into(), self.aliyun_base.clone()),
+                ("chat_models_deepseek".into(), self.chat_models_deepseek.clone()),
+                ("chat_models_aliyun".into(), self.chat_models_aliyun.clone()),
                 ("render_compat".into(), (self.render_compat as u8).to_string()),
                 ("render_compat_reason".into(), self.render_compat_reason.clone()),
             ],

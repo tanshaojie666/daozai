@@ -34,7 +34,7 @@ pub const MAIL_PAGE: usize = 5;
 pub const QUOTA_PAGE: usize = 6;
 pub const CALENDAR_PAGE: usize = 7;
 pub const WEATHER_PAGE: usize = 8;
-pub const TRANSLATE_PAGE: usize = 9;
+pub const CHAT_PAGE: usize = 9;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
@@ -79,8 +79,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 10] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "翻译"];
-/// 每页在设置窗口里对应的分页；翻译的密钥、模型都在「AI 额度」里，所以共用 11。
+pub(crate) const PAGE_NAMES: [&str; 10] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "对话"];
+/// 每页在设置窗口里对应的分页；对话的密钥、模型都在「AI 额度」里，所以共用 11。
 pub(crate) const PAGE_SETTINGS_TABS: [usize; 10] = [1,2,3,5,4,7,11,8,12,11];
 
 // ---------- 动效参数 ----------
@@ -888,8 +888,8 @@ pub struct App {
     /// v0.5.6：日历（CalDAV）配置、未来 24 小时事件与设置表单。
     pub(crate) calendar: CalendarState,
     pub(crate) quota: crate::quota_ui::State,
-    /// 快捷翻译页：原文、译文与进行中的请求。
-    pub(crate) translate: crate::translate::Translate,
+    /// AI 对话页：历史消息、输入草稿与进行中的流式请求。
+    pub(crate) chat: crate::chat::Chat,
     /// 天气页的当前数据与后台拉取状态。
     pub(crate) weather: crate::weather::State,
     pub(crate) weather_source: crate::weather_source_ui::State,
@@ -1024,7 +1024,7 @@ impl App {
             mail_lines_cache: Vec::new(),
             calendar: CalendarState::load(),
             quota: crate::quota_ui::State::load(),
-            translate: Default::default(),
+            chat: Default::default(),
             weather,
             weather_source,
             updates: crate::updates::State::load(model::config_dir().join("update-check.json")),
@@ -1639,6 +1639,8 @@ impl App {
 
     pub fn is_editing(&self) -> bool {
         self.adding || self.editing.is_some() || self.todo_choosing || self.task_dialog.is_some() || self.calendar.draft.is_some() || self.settings_editing
+            // 对话输入框有焦点时也要放开 WS_EX_NOACTIVATE，否则窗口拿不到键盘焦点。
+            || (self.page == CHAT_PAGE && self.chat.focused)
     }
 
     pub fn filter_todo_input(&mut self,input:&mut egui::RawInput) {
@@ -1700,6 +1702,8 @@ impl App {
         self.todo_input_focused=false;
         self.todo_ime_active=false;
         self.todo_ime_frame=false;
+        // 对话输入框也要交出焦点，下一次绘制时再归还给系统。
+        self.chat.blur = true;
     }
 
     /// 外壳据此调整音乐采样频率：看着音乐页时最快，收起显示歌词次之，其余只需跟上歌名和播放状态。
@@ -1814,7 +1818,7 @@ impl App {
     }
 
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==TRANSLATE_PAGE {crate::translate::TRANSLATE_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==CHAT_PAGE {crate::chat::CHAT_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
 
     // ---------------------------------------------------------------
@@ -1952,7 +1956,7 @@ impl App {
         if (!self.is_editing() || self.todo_choosing) && page_hover && self.open && self.reveal > 0.95 {
             let (scroll, left, right, esc) = ctx.input(|i| (i.raw_scroll_delta.y, i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Escape)));
             if esc { self.hover_lock = true; }
-            if (left || right) && !self.todo_choosing {
+            if (left || right) && !self.todo_choosing && !(self.page==CHAT_PAGE && self.chat.focused) {
                 self.wheel_delta=0.0;
                 self.navigate_page(right);
             } else if scroll!=0.0 {
@@ -1961,9 +1965,9 @@ impl App {
                 let mail_list=self.page==5 && !self.mail.accounts.is_empty() && self.mail.open_uid.is_none() && self.mail_list_bounds().contains(cursor);
                 let music_volume=self.page==0 && (Rect::from_min_max(Pos2::new(354.0,106.0),Pos2::new(380.0,130.0)).contains(cursor)
                     || self.music_volume_open && crate::pages::MUSIC_VOLUME_RECT.contains(cursor));
-                // 翻译页的原文/译文框自己滚动，光标停在里面时不翻页。
-                let translate_body=self.page==TRANSLATE_PAGE && crate::translate::TEXT_AREA.contains(cursor);
-                if mail_reading || mail_list || music_volume || translate_body {self.wheel_delta=0.0;}
+                // 对话页的消息区自己滚动，光标停在里面时不翻页。
+                let chat_body=self.page==CHAT_PAGE && crate::chat::CHAT_BODY.contains(cursor);
+                if mail_reading || mail_list || music_volume || chat_body {self.wheel_delta=0.0;}
                 else {
                     // 累积高精度滚轮的小幅输入；停顿或反向时丢弃上一段余量。
                     if self.t-self.wheel_at>0.18 || self.wheel_delta*scroll<0.0 {self.wheel_delta=0.0;}
@@ -3103,7 +3107,7 @@ impl App {
             6 => ("AI", "额度", theme::SOFT_GREEN),
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
-            TRANSLATE_PAGE => ("快捷", "翻译", theme::BLUE),
+            CHAT_PAGE => ("AI", "对话", theme::BLUE),
             _ => ("岛仔", "设置", theme::WHITE),
         };
         let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
@@ -3115,7 +3119,7 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        let arrow_y=if self.page==6||self.page==8{88.0}else if self.page==TRANSLATE_PAGE{104.0}else{68.0};
+        let arrow_y=if self.page==6||self.page==8{88.0}else if self.page==CHAT_PAGE{104.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3162,7 +3166,7 @@ impl App {
             5 => self.page_mail(c, env, cmds),
             6 => self.page_quota(c),
             8 => self.page_weather(c,env,cmds),
-            TRANSLATE_PAGE => self.page_translate(c,env,cmds),
+            CHAT_PAGE => self.page_chat(c,env,cmds),
             CALENDAR_PAGE => self.page_calendar(c,env),
             _ => self.page_settings(c),
         }

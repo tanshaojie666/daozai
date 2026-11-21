@@ -48,6 +48,15 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    // GNU 目标走 mingw 链接时，shcore / winsqlite3 的导入库不在 rustc 自带的那一套里。
+    // 仓库内自带一份，只追加搜索路径，不动 RUSTFLAGS（否则整棵依赖树都要重编译）。
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("vendor").join("gnu");
+        if dir.is_dir() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // rc.exe 产出 .res，windres 产出 COFF 对象；两者都能直接交给链接器。
