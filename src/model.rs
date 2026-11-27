@@ -313,11 +313,18 @@ pub struct Settings {
     pub render_compat: bool,
     /// 自动切换到兼容渲染的原因；手动开启时为空。
     pub render_compat_reason: String,
+    /// 兼容渲染是不是崩溃后自动切过来的（手动开启为 false）。只有自动切换的才会在驱动更新后重试 OpenGL，
+    /// 免得一次偶发崩溃把用户永久按在额外一百多兆的 Direct3D 12 上。
+    pub render_compat_auto: bool,
+    /// 自动切换时记下的 OpenGL 驱动指纹（模块名 + 大小 + 修改时间），用来判断驱动是否换过一版。
+    pub render_compat_gl_stamp: String,
+    /// 已经为「驱动更新后重试 OpenGL」重放过几次，避免反复折腾。
+    pub render_compat_retries: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), chat_model: "deepseek-chat".into(), chat_provider: "deepseek".into(), aliyun_model: "qwen-plus".into(), aliyun_base: String::new(), chat_models_deepseek: crate::chat::DEEPSEEK_MODELS.into(), chat_models_aliyun: crate::chat::ALIYUN_MODELS.into(), render_compat: false, render_compat_reason: String::new() }
+        Self { display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, oled_shift: false, dock: Dock::Top, settings_theme: Default::default(), pet: true, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true; 10], page_order: [0,1,2,3,4,5,6,7,8,9], show_clock: true, show_battery: true, show_weather: true, clock_12h: false, clock_period: 0, clock_seconds: false, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, wecom_notifications:false, feishu_notifications:false, dingtalk_notifications:false, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, system_notify: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, avoid_top_bar: true, top_bar_on_top: false, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, sit_remind: true, sit_minutes: 60, lunch_rest: true, lunch_start: 720, lunch_end: 810, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true, weather_city: String::new(), weather_position: None, weather_saved: Vec::new(), chat_model: "deepseek-chat".into(), chat_provider: "deepseek".into(), aliyun_model: "qwen-plus".into(), aliyun_base: String::new(), chat_models_deepseek: crate::chat::DEEPSEEK_MODELS.into(), chat_models_aliyun: crate::chat::ALIYUN_MODELS.into(), render_compat: false, render_compat_reason: String::new(), render_compat_auto: false, render_compat_gl_stamp: String::new(), render_compat_retries: 0 }
     }
 }
 
@@ -455,6 +462,9 @@ impl Settings {
                 "chat_models_deepseek" => s.chat_models_deepseek = clean_models(&v, crate::chat::DEEPSEEK_MODELS),
                 "chat_models_aliyun" => s.chat_models_aliyun = clean_models(&v, crate::chat::ALIYUN_MODELS),
                 "render_compat_reason" => s.render_compat_reason = v.chars().filter(|c| !c.is_control()).take(200).collect(),
+                "render_compat_auto" => s.render_compat_auto = v == "1",
+                "render_compat_gl_stamp" => s.render_compat_gl_stamp = v.chars().filter(|c| !c.is_control()).take(120).collect(),
+                "render_compat_retries" => s.render_compat_retries = v.parse::<u8>().unwrap_or(0).min(5),
                 _ => {}
             }
         }
@@ -545,6 +555,9 @@ impl Settings {
                 ("chat_models_aliyun".into(), self.chat_models_aliyun.clone()),
                 ("render_compat".into(), (self.render_compat as u8).to_string()),
                 ("render_compat_reason".into(), self.render_compat_reason.clone()),
+                ("render_compat_auto".into(), (self.render_compat_auto as u8).to_string()),
+                ("render_compat_gl_stamp".into(), self.render_compat_gl_stamp.clone()),
+                ("render_compat_retries".into(), self.render_compat_retries.to_string()),
             ],
         );
     }

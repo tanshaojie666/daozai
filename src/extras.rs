@@ -1639,8 +1639,12 @@ impl App {
                             settings_advanced(ui,"settings-general-advanced",|ui|{
                                 let before=self.settings.render_compat;
                                 setting_row(ui,"兼容渲染（Direct3D 12）","出现黑框、闪烁或打开设置后崩溃时开启；切换后重启岛仔生效",&mut self.settings.render_compat);
-                                // 手动关闭后不再显示自动切换的原因；再次开启视为手动开启。
-                                if before!=self.settings.render_compat {self.settings.render_compat_reason.clear();}
+                                // 手动关闭后不再显示自动切换的原因；再次开启视为手动开启，不再被自动重试回退。
+                                if before!=self.settings.render_compat {
+                                    self.settings.render_compat_reason.clear();
+                                    self.settings.render_compat_auto=false;
+                                    self.settings.render_compat_gl_stamp.clear();
+                                }
                                 if !self.settings.render_compat_reason.is_empty() {settings_hint(ui,&self.settings.render_compat_reason);}
                             });
                             // 待重启的提示不折叠，收起「高级」也能看到。

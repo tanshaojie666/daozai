@@ -41,6 +41,9 @@ fn forced_compatible()->bool {
 }
 
 pub fn run(options:eframe::NativeOptions,launch:impl FnMut(eframe::NativeOptions)->eframe::Result<()>)->eframe::Result<()> {
+    // 兼容渲染是上次崩溃后自动切过来的、而显卡驱动已经更新过时，先回到 OpenGL 再试一次；
+    // 自动切换不该让用户永久多付一百多兆内存。
+    let _=daozai::renderer::retry_after_driver_update();
     // 上次崩在显卡 OpenGL 驱动里时，崩溃处理留下的标记会在这里转成设置。
     let _=daozai::renderer::apply_pending_fallback();
     run_with(forced_compatible() || daozai::renderer::compat_requested(),options,launch)
