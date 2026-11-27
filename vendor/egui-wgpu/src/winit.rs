@@ -4,13 +4,193 @@
 use crate::capture::{capture_channel, CaptureReceiver, CaptureSender, CaptureState};
 use crate::{renderer, RenderState, SurfaceErrorAction, WgpuConfiguration};
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
-use std::{num::NonZeroU32, sync::Arc};
+use std::{
+    num::NonZeroU32,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
+static SURFACE_FAILURES: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+static SKIPPED_FRAME_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(windows, feature = "surface-test"))]
+mod surface_recovery_test;
+#[cfg(all(windows, feature = "surface-test"))]
+#[doc(hidden)]
+pub use surface_recovery_test::verify_dx12_surface_recovery;
+
+/// 取出采样期间的取帧失败计数（超时、过期、丢失、内存不足、其他）和跳帧提交次数。
+pub fn take_surface_failures() -> ([usize; 5], usize) {
+    (
+        std::array::from_fn(|i| SURFACE_FAILURES[i].swap(0, Ordering::Relaxed)),
+        SKIPPED_FRAME_SUBMISSIONS.swap(0, Ordering::Relaxed),
+    )
+}
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
     alpha_mode: wgpu::CompositeAlphaMode,
     width: u32,
     height: u32,
+    #[cfg(all(windows, feature = "direct-composition"))]
+    dcomp: Option<DirectCompositionTarget>,
+}
+
+#[cfg(all(windows, feature = "direct-composition"))]
+use std::sync::atomic::AtomicIsize;
+#[cfg(all(windows, feature = "direct-composition"))]
+use windows::Win32::Graphics::DirectComposition::IDCompositionDevice;
+
+#[cfg(all(windows, feature = "direct-composition"))]
+static DCOMP_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(all(windows, feature = "direct-composition"))]
+static DCOMP_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 查询此窗口是否已经启用 DirectComposition 透明交换链。
+#[cfg(all(windows, feature = "direct-composition"))]
+pub fn direct_composition_active(hwnd: isize) -> bool {
+    hwnd != 0 && DCOMP_HWND.load(Ordering::Relaxed) == hwnd
+}
+
+/// 判断根窗口能否使用空闲等待的重绘节奏。
+#[cfg(all(windows, feature = "direct-composition"))]
+pub fn has_direct_composition_surface() -> bool {
+    DCOMP_HWND.load(Ordering::Relaxed) != 0
+}
+
+/// 取出最近一次 DirectComposition 初始化或配置错误。
+#[cfg(all(windows, feature = "direct-composition"))]
+pub fn take_direct_composition_error() -> Option<String> {
+    DCOMP_ERROR.lock().unwrap().take()
+}
+
+/// 保存错误，供宿主写入材质诊断日志。
+#[cfg(all(windows, feature = "direct-composition"))]
+pub fn record_direct_composition_error(error: String) {
+    *DCOMP_ERROR.lock().unwrap() = Some(error);
+}
+
+#[cfg(all(windows, feature = "direct-composition"))]
+struct DirectCompositionTarget {
+    hwnd: isize,
+    device: IDCompositionDevice,
+    _target: windows::Win32::Graphics::DirectComposition::IDCompositionTarget,
+    _window: Arc<winit::window::Window>,
+}
+
+#[cfg(all(windows, feature = "direct-composition"))]
+impl Drop for DirectCompositionTarget {
+    fn drop(&mut self) {
+        let _ = DCOMP_HWND.compare_exchange(self.hwnd, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(windows, feature = "direct-composition"))]
+fn create_direct_composition_surface(
+    window: Arc<winit::window::Window>,
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+) -> Result<(wgpu::Surface<'static>, DirectCompositionTarget), crate::WgpuError> {
+    use crate::WgpuError::DirectComposition;
+    use windows::core::Interface as _;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, D3D11_SDK_VERSION,
+    };
+    use windows::Win32::Graphics::DirectComposition::DCompositionCreateDevice2;
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+    let RawWindowHandle::Win32(win32) = window.window_handle()?.as_raw() else {
+        return Err(DirectComposition("无法取得 Win32 窗口句柄".into()));
+    };
+    let hwnd = win32.hwnd.get();
+
+    // 用同一 DXGI 适配器创建 D3D11 设备，兼顾无法从 D3D12 查询 IDXGIDevice 的驱动。
+    let dxgi_adapter = unsafe {
+        adapter.as_hal::<wgpu::hal::api::Dx12, _, _>(|hal| {
+            hal.map(|adapter| adapter.raw_dxgi_adapter().clone())
+        })
+    }
+    .ok_or_else(|| DirectComposition("当前适配器未使用 Direct3D 12".into()))?;
+    let mut d3d11: Option<ID3D11Device> = None;
+    unsafe {
+        D3D11CreateDevice(
+            &dxgi_adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            None,
+            Default::default(),
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut d3d11),
+            None,
+            None,
+        )
+    }
+    .map_err(|error| DirectComposition(format!("D3D11CreateDevice：{error}")))?;
+    let d3d11 = d3d11.ok_or_else(|| DirectComposition("D3D11CreateDevice 未返回设备".into()))?;
+    let dxgi_device: IDXGIDevice = d3d11
+        .cast()
+        .map_err(|error| DirectComposition(format!("IDXGIDevice：{error}")))?;
+    let device: IDCompositionDevice = unsafe { DCompositionCreateDevice2(&dxgi_device) }
+        .map_err(|error| DirectComposition(format!("DCompositionCreateDevice2：{error}")))?;
+    let visual = unsafe { device.CreateVisual() }
+        .map_err(|error| DirectComposition(format!("CreateVisual：{error}")))?;
+    let target = unsafe { device.CreateTargetForHwnd(HWND(hwnd as *mut _), true) }
+        .map_err(|error| DirectComposition(format!("CreateTargetForHwnd：{error}")))?;
+    unsafe { target.SetRoot(&visual) }
+        .map_err(|error| DirectComposition(format!("SetRoot：{error}")))?;
+
+    // wgpu-hal 持有 visual 的 COM 引用。SurfaceState 先释放 Surface，再释放 target 和窗口。
+    let surface = unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(
+            visual.as_raw(),
+        ))?
+    };
+    Ok((
+        surface,
+        DirectCompositionTarget {
+            hwnd,
+            device,
+            _target: target,
+            _window: window,
+        },
+    ))
+}
+
+#[cfg(all(windows, feature = "direct-composition"))]
+fn configure_direct_composition(
+    surface: &wgpu::Surface<'_>,
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    target: &DirectCompositionTarget,
+) -> Result<(), crate::WgpuError> {
+    use crate::WgpuError::DirectComposition;
+    use wgpu::ErrorFilter;
+
+    for filter in [
+        ErrorFilter::Validation,
+        ErrorFilter::Internal,
+        ErrorFilter::OutOfMemory,
+    ] {
+        device.push_error_scope(filter);
+    }
+    surface.configure(device, config);
+    let mut error = None;
+    for _ in 0..3 {
+        error = error.or(pollster::block_on(device.pop_error_scope()));
+    }
+    if let Some(error) = error {
+        return Err(DirectComposition(error.to_string()));
+    }
+    // wgpu-hal 已给 visual 设置交换链内容，此处提交 DComp 合成树。
+    unsafe { target.device.Commit() }
+        .map_err(|error| DirectComposition(format!("Commit：{error}")))?;
+    DCOMP_HWND.store(target.hwnd, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -29,6 +209,10 @@ pub struct Painter {
 
     instance: wgpu::Instance,
     render_state: Option<RenderState>,
+    #[cfg(all(windows, feature = "surface-test"))]
+    surface_error_for_test: Option<wgpu::SurfaceError>,
+    #[cfg(all(windows, feature = "direct-composition"))]
+    direct_composition_error: Option<crate::WgpuError>,
 
     // Per viewport/window:
     depth_texture_view: ViewportIdMap<wgpu::TextureView>,
@@ -73,6 +257,10 @@ impl Painter {
 
             instance,
             render_state: None,
+            #[cfg(all(windows, feature = "surface-test"))]
+            surface_error_for_test: None,
+            #[cfg(all(windows, feature = "direct-composition"))]
+            direct_composition_error: None,
 
             depth_texture_view: Default::default(),
             surfaces: Default::default(),
@@ -81,6 +269,12 @@ impl Painter {
             capture_tx,
             capture_rx,
         }
+    }
+
+    /// 取出根窗口在运行期发生的 DirectComposition 错误。
+    #[cfg(all(windows, feature = "direct-composition"))]
+    pub fn take_direct_composition_error(&mut self) -> Option<crate::WgpuError> {
+        self.direct_composition_error.take()
     }
 
     /// Get the [`RenderState`].
@@ -94,7 +288,7 @@ impl Painter {
         surface_state: &SurfaceState,
         render_state: &RenderState,
         config: &WgpuConfiguration,
-    ) {
+    ) -> Result<(), crate::WgpuError> {
         profiling::function_scope!();
 
         let width = surface_state.width;
@@ -116,9 +310,20 @@ impl Painter {
             surf_config.desired_maximum_frame_latency = desired_maximum_frame_latency;
         }
 
+        #[cfg(all(windows, feature = "direct-composition"))]
+        if let Some(target) = &surface_state.dcomp {
+            return configure_direct_composition(
+                &surface_state.surface,
+                &render_state.device,
+                &surf_config,
+                target,
+            );
+        }
+
         surface_state
             .surface
             .configure(&render_state.device, &surf_config);
+        Ok(())
     }
 
     /// Updates (or clears) the [`winit::window::Window`] associated with the [`Painter`]
@@ -152,10 +357,21 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
+                #[cfg(all(windows, feature = "direct-composition"))]
+                if self.configuration.direct_composition && viewport_id == ViewportId::ROOT {
+                    return self.add_direct_composition_surface(window).await;
+                }
+
                 let surface = self.instance.create_surface(window)?;
                 self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
+            #[cfg(all(windows, feature = "direct-composition"))]
+            if self.configuration.direct_composition {
+                self.surfaces.remove(&viewport_id);
+                return Ok(());
+            }
+
             log::warn!("No window - clearing all surfaces");
             self.surfaces.clear();
         }
@@ -189,6 +405,48 @@ impl Painter {
             self.surfaces.clear();
         }
         Ok(())
+    }
+
+    #[cfg(all(windows, feature = "direct-composition"))]
+    async fn add_direct_composition_surface(
+        &mut self,
+        window: Arc<winit::window::Window>,
+    ) -> Result<(), crate::WgpuError> {
+        let size = window.inner_size();
+        if self.render_state.is_none() {
+            self.render_state = Some(
+                RenderState::create(
+                    &self.configuration,
+                    &self.instance,
+                    None,
+                    self.depth_format,
+                    self.msaa_samples,
+                    self.dithering,
+                )
+                .await?,
+            );
+        }
+        let adapter = &self.render_state.as_ref().unwrap().adapter;
+        let (surface, target) = create_direct_composition_surface(window, &self.instance, adapter)?;
+        if !surface
+            .get_capabilities(adapter)
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            return Err(crate::WgpuError::DirectComposition(
+                "交换链不支持预乘 alpha".into(),
+            ));
+        }
+        self.install_surface(
+            ViewportId::ROOT,
+            SurfaceState {
+                surface,
+                width: size.width.max(1),
+                height: size.height.max(1),
+                alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+                dcomp: Some(target),
+            },
+        )
     }
 
     async fn add_surface(
@@ -226,24 +484,41 @@ impl Painter {
         } else {
             wgpu::CompositeAlphaMode::Auto
         };
-        self.surfaces.insert(
+        self.install_surface(
             viewport_id,
             SurfaceState {
                 surface,
                 width: size.width,
                 height: size.height,
                 alpha_mode,
+                #[cfg(all(windows, feature = "direct-composition"))]
+                dcomp: None,
             },
-        );
-        let Some(width) = NonZeroU32::new(size.width) else {
+        )
+    }
+
+    fn install_surface(
+        &mut self,
+        viewport_id: ViewportId,
+        surface: SurfaceState,
+    ) -> Result<(), crate::WgpuError> {
+        let width = NonZeroU32::new(surface.width);
+        let height = NonZeroU32::new(surface.height);
+        self.surfaces.insert(viewport_id, surface);
+        let Some(width) = width else {
             log::debug!("The window width was zero; skipping generate textures");
             return Ok(());
         };
-        let Some(height) = NonZeroU32::new(size.height) else {
+        let Some(height) = height else {
             log::debug!("The window height was zero; skipping generate textures");
             return Ok(());
         };
-        self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height);
+        if let Err(error) =
+            self.resize_and_generate_depth_texture_view_and_msaa_view(viewport_id, width, height)
+        {
+            self.surfaces.remove(&viewport_id);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -263,7 +538,7 @@ impl Painter {
         viewport_id: ViewportId,
         width_in_pixels: NonZeroU32,
         height_in_pixels: NonZeroU32,
-    ) {
+    ) -> Result<(), crate::WgpuError> {
         profiling::function_scope!();
 
         let width = width_in_pixels.get();
@@ -275,7 +550,7 @@ impl Painter {
         surface_state.width = width;
         surface_state.height = height;
 
-        Self::configure_surface(surface_state, render_state, &self.configuration);
+        Self::configure_surface(surface_state, render_state, &self.configuration)?;
 
         if let Some(depth_format) = self.depth_format {
             self.depth_texture_view.insert(
@@ -327,6 +602,7 @@ impl Painter {
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             );
         };
+        Ok(())
     }
 
     pub fn on_window_resized(
@@ -338,11 +614,18 @@ impl Painter {
         profiling::function_scope!();
 
         if self.surfaces.contains_key(&viewport_id) {
-            self.resize_and_generate_depth_texture_view_and_msaa_view(
+            if let Err(error) = self.resize_and_generate_depth_texture_view_and_msaa_view(
                 viewport_id,
                 width_in_pixels,
                 height_in_pixels,
-            );
+            ) {
+                #[cfg(not(all(windows, feature = "direct-composition")))]
+                log::warn!("{error}");
+                #[cfg(all(windows, feature = "direct-composition"))]
+                {
+                    self.direct_composition_error = Some(error);
+                }
+            }
         } else {
             log::warn!("Ignoring window resize notification with no surface created via Painter::set_window()");
         }
@@ -412,22 +695,76 @@ impl Painter {
             profiling::scope!("get_current_texture");
             // This is what vsync-waiting happens on my Mac.
             let start = web_time::Instant::now();
+            #[cfg(all(windows, feature = "surface-test"))]
+            let output_frame = match self.surface_error_for_test.take() {
+                Some(error) => Err(error),
+                None => surface_state.surface.get_current_texture(),
+            };
+            #[cfg(not(all(windows, feature = "surface-test")))]
             let output_frame = surface_state.surface.get_current_texture();
             vsync_sec += start.elapsed().as_secs_f32();
             output_frame
         };
 
+        let free_textures = |state: &RenderState| {
+            let mut renderer = state.renderer.write();
+            for id in &textures_delta.free {
+                renderer.free_texture(id);
+            }
+        };
         let output_frame = match output_frame {
             Ok(frame) => frame,
-            Err(err) => match (*self.configuration.on_surface_error)(err) {
-                SurfaceErrorAction::RecreateSurface => {
-                    Self::configure_surface(surface_state, render_state, &self.configuration);
+            Err(err) => {
+                let kind = match err {
+                    wgpu::SurfaceError::Timeout => 0,
+                    wgpu::SurfaceError::Outdated => 1,
+                    wgpu::SurfaceError::Lost => 2,
+                    wgpu::SurfaceError::OutOfMemory => 3,
+                    wgpu::SurfaceError::Other => 4,
+                };
+                SURFACE_FAILURES[kind].fetch_add(1, Ordering::Relaxed);
+
+                #[cfg(all(windows, feature = "direct-composition"))]
+                if surface_state.dcomp.is_some()
+                    && matches!(err, wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)
+                {
+                    self.direct_composition_error =
+                        Some(crate::WgpuError::DirectComposition(err.to_string()));
                     return vsync_sec;
                 }
-                SurfaceErrorAction::SkipFrame => {
+
+                // 绘制已跳过，仍要提交纹理、顶点等已排队的上传，避免缓冲逐帧积压。
+                // 先丢弃绘制命令，再提交上传，最后处理本帧的纹理释放。
+                drop(user_cmd_bufs);
+                drop(encoder);
+                render_state.queue.submit([]);
+                SKIPPED_FRAME_SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+                free_textures(render_state);
+
+                #[cfg(all(windows, feature = "direct-composition"))]
+                if surface_state.dcomp.is_some() {
+                    self.direct_composition_error = match err {
+                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                            Self::configure_surface(surface_state, render_state, &self.configuration)
+                                .err()
+                        }
+                        _ => None,
+                    };
                     return vsync_sec;
                 }
-            },
+
+                if matches!(
+                    (*self.configuration.on_surface_error)(err),
+                    SurfaceErrorAction::RecreateSurface
+                ) {
+                    if let Err(error) =
+                        Self::configure_surface(surface_state, render_state, &self.configuration)
+                    {
+                        log::warn!("{error}");
+                    }
+                }
+                return vsync_sec;
+            }
         };
 
         let mut capture_buffer = None;
@@ -523,12 +860,7 @@ impl Painter {
         // Free textures marked for destruction **after** queue submit since they might still be used in the current frame.
         // Calling `wgpu::Texture::destroy` on a texture that is still in use would invalidate the command buffer(s) it is used in.
         // However, once we called `wgpu::Queue::submit`, it is up for wgpu to determine how long the underlying gpu resource has to live.
-        {
-            let mut renderer = render_state.renderer.write();
-            for id in &textures_delta.free {
-                renderer.free_texture(id);
-            }
-        }
+        free_textures(render_state);
 
         if let Some(capture_buffer) = capture_buffer {
             if let Some(screen_capture_state) = &mut self.screen_capture_state {

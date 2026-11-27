@@ -41,6 +41,8 @@ pub static TEXTURE_BYTES:AtomicUsize=AtomicUsize::new(0);
 pub static GALLEYS:AtomicUsize=AtomicUsize::new(0);
 /// 主界面画了多少帧（每次采样后清零）：闲置时本应很低，持续接近 60 帧/秒说明有东西在空转重绘。
 pub static FRAMES:AtomicUsize=AtomicUsize::new(0);
+/// 本帧插件定时、结果回收和提醒的耗时（微秒），慢帧记录分段用。
+pub static PLUGIN_FRAME_US:AtomicUsize=AtomicUsize::new(0);
 
 struct Pending { _lease:Lease, ready:Box<dyn Fn()->bool+Send>, after:Instant }
 pub struct PendingRequests(Mutex<Vec<Pending>>);
@@ -141,6 +143,10 @@ fn record(value:Snapshot)->String {
     let since=LAST.lock().unwrap_or_else(|e|e.into_inner()).replace(Instant::now()).map(|at|at.elapsed().as_secs_f64());
     let frames=FRAMES.swap(0,Ordering::Relaxed);
     let _=write!(line," fps={}",since.filter(|s|*s>0.5).map_or("-".into(),|s|format!("{:.1}",frames as f64/s)));
+    let ([timeout,outdated,lost,oom,other],submitted)=eframe::egui_wgpu::winit::take_surface_failures();
+    if timeout+outdated+lost+oom+other+submitted>0 {
+        let _=write!(line," wgpu_skipped={} wgpu_surface_timeout={timeout} wgpu_surface_outdated={outdated} wgpu_surface_lost={lost} wgpu_surface_oom={oom} wgpu_surface_other={other} wgpu_skip_submit={submitted}",timeout+outdated+lost+oom+other);
+    }
     for lane in [&POLLER,&ARTWORK,&COVER,&LYRICS,&NATIVE_LYRICS,&CONTROL,&VOLUME,&ASYNC,&ASYNC_ARTWORK,&MONITOR] {
         let _=write!(line," {}={}/{}/{}/{}",lane.name,lane.active(),lane.limit,lane.started.load(Ordering::Relaxed),lane.denied.load(Ordering::Relaxed));
     }

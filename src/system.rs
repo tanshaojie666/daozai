@@ -2,8 +2,10 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use windows::core::{Result, HSTRING, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
+use windows::Win32::Foundation::{CloseHandle, HWND, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -20,7 +22,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::UI::Notifications::Management::{
     UserNotificationListener, UserNotificationListenerAccessStatus,
 };
-use windows::UI::Notifications::{NotificationKinds, UserNotification};
+use windows::UI::Notifications::{NotificationKinds, UserNotification, UserNotificationChangedEventArgs};
+use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+
+#[path="notification_wake.rs"]
+mod notification_wake;
+use notification_wake::{NotificationEvent, NotificationLog};
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -308,6 +315,14 @@ unsafe fn log_maximized_exclusion(hwnd: HWND, window: RECT, monitor: RECT) {
     crate::resources::append_log(&crate::model::config_dir().join("diagnostics"), "fullscreen.log", &line);
 }
 
+unsafe fn is_shell_surface(hwnd:HWND)->bool {
+    if hwnd==GetShellWindow(){return true;}
+    let mut class=[0u16;64];
+    let len=GetClassNameW(hwnd,&mut class).max(0) as usize;
+    ["Progman","WorkerW","Shell_TrayWnd"].iter()
+        .any(|name|class[..len].iter().copied().eq(name.encode_utf16()))
+}
+
 pub fn fullscreen() -> Option<crate::display_layout::Bounds> {
     use std::sync::Mutex;
     // 上一次判定为全屏的窗口：前台切到它的附属窗口时沿用（见 `keeps_fullscreen`）。
@@ -322,11 +337,7 @@ pub fn fullscreen() -> Option<crate::display_layout::Bounds> {
                 *last = None;
                 return None;
             }
-            // 桌面与资源管理器桌面窗口不能当成全屏游戏。
-            let mut cls = [0u16; 64];
-            let n = GetClassNameW(hwnd, &mut cls);
-            let cls = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
-            if matches!(cls.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd") {
+            if is_shell_surface(hwnd) {
                 *last = None;
                 return None;
             }
@@ -447,7 +458,9 @@ fn browser_overlaps_island(browser:RECT,island:RECT,dock:crate::model::Dock)->bo
     let center=island.left as f32+crate::app::WIN_W*scale/2.0;
     let half=crate::app::PW*scale/2.0;
     (browser.left as f32)<center+half && (browser.right as f32)>center-half
-        && (browser.top as f32)<island.top as f32+crate::app::BAR_H*scale && browser.bottom>island.top
+        && if dock==crate::model::Dock::Bottom {
+            browser.top<island.bottom && (browser.bottom as f32)>island.bottom as f32-crate::app::BAR_H*scale
+        }else{(browser.top as f32)<island.top as f32+crate::app::BAR_H*scale && browser.bottom>island.top}
 }
 
 /// 左右停靠：画布是 SIDE_W × SIDE_H，岛体贴在画布的左 / 右边、竖直居中。
@@ -463,7 +476,7 @@ fn window_covers_side(window:RECT,island:RECT,dock:crate::model::Dock)->bool {
     vertical && horizontal
 }
 
-pub fn browser_at_top(island:HWND,settings:&crate::model::Settings)->Option<bool> {
+pub fn browser_at_top(bounds:RECT,settings:&crate::model::Settings)->Option<bool> {
     unsafe {
         let foreground=GetForegroundWindow();
         if foreground.0.is_null(){return Some(false);}
@@ -473,7 +486,7 @@ pub fn browser_at_top(island:HWND,settings:&crate::model::Settings)->Option<bool
         if pid==GetCurrentProcessId(){return None;}
         if pid==0{return Some(false);}
         thread_local! { static LAST_MAIN: std::cell::Cell<Option<(HWND,u32)>> = const { std::cell::Cell::new(None) }; }
-        LAST_MAIN.with(|last| avoidance_for_window(foreground,island,pid,settings,last))
+        LAST_MAIN.with(|last| avoidance_for_window(foreground,bounds,pid,settings,last,||process_image_path(pid)))
     }
 }
 
@@ -503,7 +516,7 @@ unsafe fn unique_main_window(pid:u32)->Option<HWND> {
     unsafe extern "system" fn visit(hwnd:HWND,param:LPARAM)->BOOL {
         let search=&mut *(param.0 as *mut Search);
         let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
-        if pid==search.pid && foreground_info(hwnd).app_window && visible_avoidance_rect(hwnd).is_some() {
+        if pid==search.pid && !is_shell_surface(hwnd) && foreground_info(hwnd).app_window && visible_avoidance_rect(hwnd).is_some() {
             if search.main.is_some(){search.main=None;return BOOL(0);}
             search.main=Some(hwnd);
         }
@@ -514,28 +527,56 @@ unsafe fn unique_main_window(pid:u32)->Option<HWND> {
     search.main
 }
 
-unsafe fn avoidance_for_window(foreground:HWND,island:HWND,pid:u32,settings:&crate::model::Settings,last:&std::cell::Cell<Option<(HWND,u32)>>)->Option<bool> {
-    if !settings.browser_minimal || IsIconic(GetAncestor(foreground,GA_ROOTOWNER)).as_bool(){return Some(false);}
-    let Some(rect)=visible_avoidance_rect(foreground) else{return Some(false)};
-    let mut island_rect=RECT::default();GetWindowRect(island,&mut island_rect).ok()?;
-    let overlaps=|rect|browser_overlaps_island(rect,island_rect,settings.dock);
+unsafe fn process_covers_island(pid:u32,island:RECT,dock:crate::model::Dock)->bool {
+    use windows::Win32::Foundation::{BOOL,LPARAM};
+    struct Search { pid:u32, island:RECT, dock:crate::model::Dock, covered:bool }
+    unsafe extern "system" fn visit(hwnd:HWND,param:LPARAM)->BOOL {
+        let search=&mut *(param.0 as *mut Search);
+        let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
+        if pid==search.pid && visible_avoidance_rect(hwnd).is_some_and(|rect|browser_overlaps_island(rect,search.island,search.dock)) {
+            search.covered=true;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut search=Search{pid,island,dock,covered:false};
+    let _=EnumWindows(Some(visit),LPARAM((&mut search as *mut Search) as isize));
+    search.covered
+}
+
+unsafe fn avoidance_for_window(foreground:HWND,island:RECT,pid:u32,settings:&crate::model::Settings,last:&std::cell::Cell<Option<(HWND,u32)>>,image_path:impl FnOnce()->Option<String>)->Option<bool> {
+    if !settings.browser_minimal{return Some(false);}
+    // 桌面和文件夹窗口可以同属 explorer.exe，切到桌面时结束避让。
+    if is_shell_surface(foreground){last.set(None);return Some(false);}
+    if IsIconic(GetAncestor(foreground,GA_ROOTOWNER)).as_bool(){return Some(false);}
+    let rect=visible_avoidance_rect(foreground);
+    let overlaps=|rect|browser_overlaps_island(rect,island,settings.dock);
     let owner=GetWindow(foreground,GW_OWNER).ok();
     let info=foreground_info(foreground);
-    if owner.is_none() && info.app_window {last.set(Some((foreground,pid)));}
-    else if last.get().is_some_and(|(_,prev)|prev!=pid){last.set(None);}
-    let path=std::cell::LazyCell::new(||process_image_path(pid));
-    if overlaps(rect) && path.as_deref().is_some_and(|p|avoidance_matches(p,settings)){return Some(true);}
-    if settings.avoid_apps.is_empty(){return Some(false);}
+    if rect.is_some() && owner.is_none() && info.app_window {last.set(Some((foreground,pid)));}
+    else if rect.is_some() && last.get().is_some_and(|(_,prev)|prev!=pid){last.set(None);}
+    let path=std::cell::LazyCell::new(image_path);
+    let matches=|p:&str|avoidance_matches(p,settings);
+    if rect.is_some_and(overlaps) && path.as_deref().is_some_and(matches){return Some(true);}
+    if !settings.avoid_browsers && settings.avoid_apps.is_empty(){return Some(false);}
 
-    // 所有者关系可以跨进程，嵌套对话框也沿这条链找到实际遮挡岛的名单窗口。
-    let listed=|p:&str|crate::avoidance::contains_app(&settings.avoid_apps,p);
+    // 3ds Max 的插件可能以独立窗口获得焦点，或短暂无法读取可见矩形。
+    // 只在已登记的 Max 进程仍有窗口实际遮岛时延续避让。
+    if !settings.avoid_apps.is_empty() && path.as_deref().is_some_and(|p| {
+        std::path::Path::new(p).file_name().is_some_and(|name|name.eq_ignore_ascii_case("3dsmax.exe"))
+            && crate::avoidance::contains_app(&settings.avoid_apps,p)
+    }) && process_covers_island(pid,island,settings.dock) {return Some(true);}
+
+    // 浮窗暂时读不到矩形时，仍可沿所有者链找到盖住岛体的窗口。
+    // 这条关系也适用于由其他进程创建的浮窗。
     let mut parent=owner;
     while let Some(hwnd)=parent {
+        if is_shell_surface(hwnd){break;}
         if IsIconic(hwnd).as_bool(){return Some(false);}
         if visible_avoidance_rect(hwnd).is_some_and(overlaps) {
             let mut owner_pid=0;GetWindowThreadProcessId(hwnd,Some(&mut owner_pid));
-            let registered=if owner_pid==pid {path.as_deref().is_some_and(listed)}
-                else {process_image_path(owner_pid).as_deref().is_some_and(listed)};
+            let registered=if owner_pid==pid {path.as_deref().is_some_and(matches)}
+                else {process_image_path(owner_pid).as_deref().is_some_and(matches)};
             if registered{
                 if foreground_info(hwnd).app_window {last.set(Some((hwnd,owner_pid)));}
                 return Some(true);
@@ -543,7 +584,7 @@ unsafe fn avoidance_for_window(foreground:HWND,island:HWND,pid:u32,settings:&cra
         }
         parent=GetWindow(hwnd,GW_OWNER).ok();
     }
-    if owner.is_some() || info.app_window || !path.as_deref().is_some_and(listed){return Some(false);}
+    if owner.is_some() || info.app_window || !path.as_deref().is_some_and(matches){return Some(false);}
     // 部分插件工具窗未登记 owner。优先跟随刚才操作的同进程主窗口，每次重新检查其位置。
     let host=match last.get() {
         Some((hwnd,prev)) if prev==pid && foreground_info(hwnd).pid==pid=>Some(hwnd),
@@ -587,14 +628,67 @@ fn notification_body(n: &UserNotification) -> Result<String> {
 /// 停止信号独立于消息队列，断开后结束等待，不再读取通知。
 pub struct Notifications {
     incoming: Receiver<Incoming>,
-    stop: mpsc::Sender<()>,
-    taskbar_mask:std::sync::Arc<std::sync::atomic::AtomicU8>,
+    stop: Arc<NotificationEvent>,
+    taskbar_mask:Arc<std::sync::atomic::AtomicU8>,
 }
 impl Notifications {
     pub fn try_recv(&self)->std::result::Result<Incoming,mpsc::TryRecvError>{self.incoming.try_recv()}
     pub fn taskbar_settings(&self,settings:&crate::model::Settings){self.taskbar_mask.store(crate::messenger::toast_suppression(settings),std::sync::atomic::Ordering::Relaxed);}
 }
-impl Drop for Notifications {fn drop(&mut self){let _=self.stop.send(());}}
+impl Drop for Notifications {fn drop(&mut self){self.stop.signal();}}
+
+struct NotificationSubscription<'a>(&'a UserNotificationListener, EventRegistrationToken);
+impl Drop for NotificationSubscription<'_> {
+    fn drop(&mut self) { let _ = self.0.RemoveNotificationChanged(self.1); }
+}
+
+// 事件合并后再取快照，兜底补读静默更新及事件通道未报告的通知。
+const NOTIFICATION_RECONCILE: Duration = Duration::from_secs(20);
+const NOTIFICATION_POLL_FALLBACK: Duration = Duration::from_secs(5);
+const NOTIFICATION_BATCH: Duration = Duration::from_millis(200);
+const NOTIFICATION_MIN_GAP: Duration = Duration::from_millis(750);
+const NOTIFICATION_ACCOUNT_SAMPLE: Duration = Duration::from_secs(1);
+
+fn wait_for_notification_refresh(
+    stop: &NotificationEvent, change: &NotificationEvent, native: bool,
+    log: &mut Option<NotificationLog>, retry: bool, mut sample_accounts: impl FnMut(),
+) -> Result<bool> {
+    use windows::Win32::System::Threading::WaitForMultipleObjects;
+
+    let start = Instant::now();
+    let fallback = start + NOTIFICATION_POLL_FALLBACK;
+    let mut sample_at = start + NOTIFICATION_ACCOUNT_SAMPLE;
+    let mut deadline = if native || log.is_some() { start + NOTIFICATION_RECONCILE } else { fallback };
+    if retry { deadline = fallback; }
+    loop {
+        if stop.is_signaled() { return Ok(false); }
+        let now = Instant::now();
+        if now >= deadline { return Ok(true); }
+        if now >= sample_at {
+            // QQ 归属需要连续的账号样本，只枚举进程和窗口，无须读取通知列表。
+            sample_accounts();
+            sample_at = Instant::now() + NOTIFICATION_ACCOUNT_SAMPLE;
+        }
+        let remaining = deadline.min(sample_at).saturating_duration_since(Instant::now());
+        let mut handles = [stop.handle(), change.handle(), stop.handle()];
+        let count = if let Some(log) = log.as_ref() { handles[2] = log.event(); 3 } else { 2 };
+        let wait = unsafe { WaitForMultipleObjects(&handles[..count], false, remaining.as_millis().max(1) as u32) };
+        let dirty = match wait {
+            WAIT_OBJECT_0 => return Ok(false),
+            WAIT_TIMEOUT => continue,
+            wait if wait.0 == WAIT_OBJECT_0.0 + 1 => true,
+            wait if wait.0 == WAIT_OBJECT_0.0 + 2 => match log.as_ref().unwrap().drain() {
+                Ok(received) => received,
+                Err(_) => { *log = None; deadline = deadline.min(fallback); false }
+            },
+            _ => return Err(windows::core::Error::from_win32()),
+        };
+        if dirty {
+            let ready = (Instant::now() + NOTIFICATION_BATCH).max(start + NOTIFICATION_MIN_GAP);
+            deadline = deadline.min(ready);
+        }
+    }
+}
 
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum ToastBody {Skipped,Unavailable,Read(u64)}
@@ -669,8 +763,10 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
     let listener = UserNotificationListener::Current()?;
     let request = listener.RequestAccessAsync()?;
     let (tx, rx) = mpsc::sync_channel(32);
-    let (stop, stopped)=mpsc::channel();
-    let taskbar_mask=std::sync::Arc::new(std::sync::atomic::AtomicU8::new(mask));let worker_mask=taskbar_mask.clone();
+    let stop = Arc::new(NotificationEvent::new(true)?);
+    let stopped = stop.clone();
+    let change = Arc::new(NotificationEvent::new(false)?);
+    let taskbar_mask=Arc::new(std::sync::atomic::AtomicU8::new(mask));let worker_mask=taskbar_mask.clone();
     std::thread::Builder::new().name("daozai-notifications".into()).spawn(move || {
         let send=|event|{
             let result=tx.send(event);
@@ -688,13 +784,21 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                 return Ok(());
             }
             let listener = UserNotificationListener::Current()?;
+            let handler = {
+                let change = change.clone();
+                TypedEventHandler::<UserNotificationListener, UserNotificationChangedEventArgs>::new(move |_, _| { change.signal(); Ok(()) })
+            };
+            let subscription = listener.NotificationChanged(&handler).ok().map(|token| NotificationSubscription(&listener, token));
+            let mut log = None;
             let channels=crate::messenger::Messenger::ALL.into_iter().filter(|client|client.adapter().capture==crate::messenger::Capture::SystemToast)
                 .filter(|client|filter.allows(client.adapter().notification_id)).map(channel_status).collect::<Vec<_>>().join("\n");
             let mut baseline=baseline;
             let mut accounts=crate::messenger::ToastAccounts::default();accounts.sample();
             let mut last_status=String::new();
             loop {
-                if stopped.try_recv()!=Err(mpsc::TryRecvError::Empty){return Ok(());}
+                if stopped.is_signaled(){return Ok(());}
+                // 常规桌面安装没有 MSIX 包身份，Windows 可能拒绝注册 WinRT 回调。
+                if subscription.is_none() && log.is_none(){log=NotificationLog::subscribe().ok();}
                 let (items,count)=match listener.GetAccessStatus().and_then(|access|{
                     if access!=UserNotificationListenerAccessStatus::Allowed{return Ok(None);}
                     let items=listener.GetNotificationsAsync(NotificationKinds::Toast)?.get()?;let count=items.Size()?;
@@ -705,7 +809,7 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                     Err(error)=>{
                         let status=format!("Windows 通知暂时读取失败：{} · 将自动重试",error.code());
                         if status!=last_status{send(Incoming::Status(status.clone()));last_status=status;}
-                        if stopped.recv_timeout(std::time::Duration::from_secs(2))!=Err(mpsc::RecvTimeoutError::Timeout){return Ok(());}
+                        if !wait_for_notification_refresh(&stopped,&change,subscription.is_some(),&mut log,true,||accounts.sample())?{return Ok(());}
                         continue;
                     }
                 };
@@ -748,7 +852,7 @@ fn connect_inner(ctx:eframe::egui::Context,filter:crate::messenger::Notification
                     if !send(Incoming::Status(status.clone())){return Ok(());}
                     last_status=status;
                 }
-                if stopped.recv_timeout(std::time::Duration::from_secs(1))!=Err(mpsc::RecvTimeoutError::Timeout){return Ok(());}
+                if !wait_for_notification_refresh(&stopped,&change,subscription.is_some(),&mut log,!complete,||accounts.sample())?{return Ok(());}
             }
         };
         if let Err(e) = run() {
@@ -763,12 +867,22 @@ pub fn pick_files() -> Result<Vec<std::path::PathBuf>> {
 }
 
 pub fn pick_files_for(title:&str,multiple:bool) -> Result<Vec<std::path::PathBuf>> {
+    use windows::Win32::UI::Shell::*;
+    let mut options=FOS_FILEMUSTEXIST;
+    if multiple{options|=FOS_ALLOWMULTISELECT;}
+    pick_items_for(title,options)
+}
+
+pub fn pick_folder_for(title:&str) -> Result<Option<std::path::PathBuf>> {
+    use windows::Win32::UI::Shell::*;
+    Ok(pick_items_for(title,FOS_PICKFOLDERS | FOS_PATHMUSTEXIST)?.into_iter().next())
+}
+
+fn pick_items_for(title:&str,options:windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS) -> Result<Vec<std::path::PathBuf>> {
     unsafe {
         use windows::Win32::UI::Shell::*;
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL)?;
-        let mut options=FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST;
-        if multiple{options|=FOS_ALLOWMULTISELECT;}
-        dialog.SetOptions(options)?;
+        dialog.SetOptions(FOS_FORCEFILESYSTEM | options)?;
         dialog.SetTitle(&HSTRING::from(title))?;
         if let Err(e) = dialog.Show(None) {
             if e.code().0 as u32 == 0x800704c7 {
@@ -896,9 +1010,31 @@ mod tests {
     }
     #[test]
     fn notifications_disconnect_signals_stop_without_waiting_for_new_messages(){
-        let (_tx,incoming)=mpsc::sync_channel(32);let (stop,stopped)=mpsc::channel();
-        drop(Notifications{incoming,stop,taskbar_mask:std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0))});
-        assert_eq!(stopped.try_recv(),Ok(()));
+        let (_tx,incoming)=mpsc::sync_channel(32);
+        let stopped=Arc::new(NotificationEvent::new(true).unwrap());
+        let notifications=Notifications{incoming,stop:stopped.clone(),taskbar_mask:Arc::new(std::sync::atomic::AtomicU8::new(0))};
+        let (sender,receiver)=mpsc::channel();let (sampled,samples)=mpsc::channel();
+        std::thread::spawn(move || {
+            let change=NotificationEvent::new(false).unwrap();
+            let result=wait_for_notification_refresh(&stopped,&change,true,&mut None,false,||{let _=sampled.send(());});
+            sender.send(result.unwrap()).unwrap();
+        });
+        assert_eq!(samples.recv_timeout(Duration::from_secs(3)),Ok(()));
+        assert_eq!(receiver.try_recv(),Err(mpsc::TryRecvError::Empty));
+        drop(notifications);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)),Ok(false));
+    }
+    #[test]
+    fn notifications_wake_on_changes_and_coalesce_a_burst(){
+        let stop=NotificationEvent::new(true).unwrap();
+        let change=NotificationEvent::new(false).unwrap();
+        change.signal();
+        change.signal();
+        let started=Instant::now();
+        assert!(wait_for_notification_refresh(&stop,&change,true,&mut None,false,||{}).unwrap());
+        assert!(started.elapsed()>=NOTIFICATION_MIN_GAP);
+        assert!(started.elapsed()<NOTIFICATION_POLL_FALLBACK);
+        assert!(!change.is_signaled());
     }
     #[test]
     fn browser_minimal_recognizes_browsers_without_matching_electron_apps(){
@@ -1003,7 +1139,7 @@ pub(crate) fn avoidance_windows()->std::result::Result<Vec<crate::avoidance::Can
         let _=windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(hwnd,windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,(&mut cloaked as *mut u32).cast(),4);
         if cloaked!=0{return BOOL(1);}
         let mut title=[0u16;1024];let len=GetWindowTextW(hwnd,&mut title);
-        if len==0{return BOOL(1);}
+        if len==0 || is_shell_surface(hwnd){return BOOL(1);}
         let mut pid=0;GetWindowThreadProcessId(hwnd,Some(&mut pid));
         if pid==GetCurrentProcessId(){return BOOL(1);}
         let Some(path)=process_image_path(pid) else{return BOOL(1)};
@@ -1040,6 +1176,80 @@ fn executable_description(path:&str)->Option<String> {
 #[cfg(test)]
 mod avoidance_tests {
     use super::*;
+
+    #[test]
+    fn explorer_avoidance_ignores_the_desktop_even_with_an_open_folder() {
+        use windows::Win32::Foundation::{LPARAM,LRESULT,WPARAM};
+        unsafe extern "system" fn proc(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT {DefWindowProcW(h,m,w,l)}
+        unsafe {
+            let desktop_class=windows::core::w!("WorkerW");
+            let instance=windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap().into();
+            let wc=WNDCLASSW{lpfnWndProc:Some(proc),hInstance:instance,lpszClassName:desktop_class,..Default::default()};
+            assert_ne!(RegisterClassW(&wc),0);
+            let create=|class,ex| CreateWindowExW(WS_EX_NOACTIVATE|ex,class,windows::core::w!(""),
+                WS_POPUP|WS_VISIBLE,-10000,-10000,1920,1080,None,None,instance,None).unwrap();
+            let desktop=create(desktop_class,WS_EX_TOOLWINDOW);
+            let explorer=create(windows::core::w!("STATIC"),WS_EX_APPWINDOW);
+            let island=RECT{left:-10000,top:-10000,right:-9040,bottom:-9900};
+            let path=r"C:\Windows\explorer.exe";
+            let mut settings=crate::model::Settings::default();
+            settings.browser_minimal=true;
+            settings.avoid_apps.push((path.into(),"文件资源管理器".into()));
+            let last=std::cell::Cell::new(None);
+            let poll=|hwnd| avoidance_for_window(hwnd,island,GetCurrentProcessId(),&settings,&last,||Some(path.into()));
+
+            let covering=poll(explorer);
+            let desktop_result=poll(desktop);
+            let after_desktop=last.get();
+            let back_to_explorer=poll(explorer);
+            SetWindowPos(explorer,HWND_BOTTOM,-8000,-10000,1920,1080,SWP_NOACTIVATE).unwrap();
+            let moved=poll(explorer);
+            DestroyWindow(explorer).unwrap();
+            DestroyWindow(desktop).unwrap();
+            UnregisterClassW(desktop_class,instance).unwrap();
+
+            assert_eq!(covering,Some(true),"文件夹窗口遮住岛仔时应避让");
+            assert_eq!(desktop_result,Some(false),"切到桌面时不应触发或沿用资源管理器避让");
+            assert_eq!(after_desktop,None,"桌面要清除上一次资源管理器窗口");
+            assert_eq!(back_to_explorer,Some(true),"切回实际遮挡的文件夹窗口时应恢复避让");
+            assert_eq!(moved,Some(false),"文件夹窗口移开后不应避让");
+        }
+    }
+
+    #[test]
+    fn registered_3ds_max_uses_visible_same_process_windows_for_avoidance() {
+        unsafe {
+            let create=|x,y,width,height| CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_APPWINDOW,windows::core::w!("STATIC"),
+                windows::core::w!(""),WS_POPUP|WS_VISIBLE,x-10000,y-10000,width,height,None,None,None,None).unwrap();
+            let island=RECT{left:-10000,top:-10000,right:-9040,bottom:-9900};
+            let host=create(0,0,1920,1080);
+            let panel=create(600,300,300,200);
+            let mut settings=crate::model::Settings::default();
+            settings.browser_minimal=true;
+            let path=r"D:\Apps\Autodesk\3DSMAX.EXE";
+            settings.avoid_apps.push((path.into(),"3ds Max".into()));
+            let last=std::cell::Cell::new(None);
+            let poll=|path:&str| {
+                avoidance_for_window(panel,island,GetCurrentProcessId(),&settings,&last,||Some(path.into()))
+            };
+            let detached=poll(path);
+            let unregistered=poll(r"D:\Other\3dsmax.exe");
+            let _=ShowWindow(panel,SW_HIDE);
+            let hidden_panel=poll(path);
+            let _=ShowWindow(panel,SW_SHOWNOACTIVATE);
+            SetWindowPos(host,HWND_BOTTOM,-8000,-10000,1920,1080,SWP_NOACTIVATE).unwrap();
+            let moved=poll(path);
+            SetWindowPos(host,HWND_BOTTOM,-10000,-10000,1920,1080,SWP_NOACTIVATE).unwrap();
+            let _=ShowWindow(host,SW_SHOWMINNOACTIVE);
+            let minimized=poll(path);
+            DestroyWindow(panel).unwrap();
+            DestroyWindow(host).unwrap();
+            assert_eq!(detached,Some(true),"独立浮窗获得焦点时，仍遮住岛的 Max 窗口应触发避让");
+            assert_eq!(hidden_panel,Some(true),"前台浮窗短暂不可用时，仍应检查实际遮住岛的窗口");
+            assert_eq!([unregistered,moved,minimized],[Some(false);3]);
+        }
+    }
+
     #[test]
     fn registered_app_keeps_avoidance_when_its_plugin_panel_takes_focus() {
         unsafe {
@@ -1053,13 +1263,18 @@ mod avoidance_tests {
             settings.browser_minimal=true;
             settings.avoid_apps.push((path.to_string_lossy().into_owned(),"测试宿主".into()));
             let last=std::cell::Cell::new(None);
-            let poll=|window,settings:&crate::model::Settings| avoidance_for_window(window,island,GetCurrentProcessId(),settings,&last);
+            let mut island_rect=RECT::default();
+            GetWindowRect(island,&mut island_rect).unwrap();
+            let poll=|window,settings:&crate::model::Settings| {
+                let pid=GetCurrentProcessId();
+                avoidance_for_window(window,island_rect,pid,settings,&last,||process_image_path(pid))
+            };
             let results=[poll(host,&settings),poll(panel,&settings),poll(host,&settings)];
             let detached=create(600,300,300,200,None,WS_EX_TOOLWINDOW);
             let nested=create(700,400,100,100,Some(&panel),WS_EX_TOOLWINDOW);
             assert_eq!(poll(detached,&settings),Some(true),"无 owner 的同进程工具窗沿用刚获得焦点的主窗口");
             assert_eq!(poll(nested,&settings),Some(true),"嵌套插件对话框应找到宿主");
-            assert_eq!(avoidance_for_window(panel,island,0,&settings,&last),Some(true),"面板进程不可识别时仍可通过所有者识别宿主");
+            assert_eq!(avoidance_for_window(panel,island_rect,0,&settings,&last,||None),Some(true),"面板进程不可识别时仍可通过所有者识别宿主");
             let independent=create(600,300,300,200,None,WS_EX_APPWINDOW);
             last.set(None);
             assert_eq!(poll(detached,&settings),Some(false),"两个可见主窗且无法确定宿主时，不借用后台窗口");
@@ -1081,7 +1296,15 @@ mod avoidance_tests {
             let minimized_owner=poll(panel,&settings);
             let _=ShowWindow(host,SW_SHOWNOACTIVATE);
             let _=ShowWindow(panel,SW_HIDE);
-            let hidden=poll(panel,&settings);
+            let hidden_panel=poll(panel,&settings);
+            let hidden_panel_with_unknown_process=avoidance_for_window(panel,island_rect,0,&settings,&last,||None);
+            let _=ShowWindow(detached,SW_HIDE);
+            let hidden_tool=poll(detached,&settings);
+            let _=ShowWindow(independent,SW_HIDE);
+            let hidden_independent=poll(independent,&settings);
+            let _=ShowWindow(host,SW_HIDE);
+            let hidden_host=poll(panel,&settings);
+            let _=ShowWindow(host,SW_SHOWNOACTIVATE);
             let _=ShowWindow(panel,SW_SHOWNOACTIVATE);
             settings.browser_minimal=false;
             let disabled=poll(panel,&settings);
@@ -1095,10 +1318,35 @@ mod avoidance_tests {
             assert_eq!(results,[Some(true);3],"焦点从宿主切到中央插件浮窗再切回时应持续避让");
             assert_eq!(small,Some(false),"同进程的独立小窗只检查自己的位置");
             assert_eq!(other_screen,[Some(false);2],"主窗口移到副屏后，浮窗也应停止避让");
-            assert_eq!([minimized,minimized_owner,hidden],[Some(false);3],"收起或隐藏的应用窗口应结束避让");
+            assert_eq!([hidden_panel,hidden_panel_with_unknown_process,hidden_tool],[Some(true);3],"前台浮窗不可见时仍应检查已识别的宿主");
+            assert_eq!([minimized,minimized_owner,hidden_host,hidden_independent],[Some(false);4],"宿主收起或隐藏时结束避让，独立小窗也不能借用后台窗口");
             assert_eq!((disabled,removed),(Some(false),Some(false)));
         }
     }
+
+    #[test]
+    fn browser_popup_follows_its_owner_when_browser_avoidance_is_enabled() {
+        unsafe {
+            let create=|x,y,width,height,owner| CreateWindowExW(WS_EX_NOACTIVATE,windows::core::w!("STATIC"),
+                windows::core::w!(""),WS_POPUP|WS_VISIBLE,x-10000,y-10000,width,height,owner,None,None,None).unwrap();
+            let island=RECT{left:-10000,top:-10000,right:-9040,bottom:-9900};
+            let host=create(0,0,1920,1080,None);
+            let panel=create(600,300,300,200,Some(&host));
+            let _=ShowWindow(panel,SW_HIDE);
+            let mut settings=crate::model::Settings::default();
+            settings.browser_minimal=true;
+            let last=std::cell::Cell::new(None);
+            let poll=|settings:&crate::model::Settings| {
+                avoidance_for_window(panel,island,GetCurrentProcessId(),settings,&last,||Some(r"D:\Apps\chrome.exe".into()))
+            };
+            let enabled=poll(&settings);
+            settings.avoid_browsers=false;
+            let disabled=poll(&settings);
+            DestroyWindow(host).unwrap();
+            assert_eq!((enabled,disabled),(Some(true),Some(false)));
+        }
+    }
+
     #[test]
     fn avoidance_respects_master_browser_switch_and_custom_app_identity() {
         let mut settings=crate::model::Settings::default();
